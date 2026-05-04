@@ -212,6 +212,7 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 	cityName := loadedCityName(cfg, cityPath)
 
 	var target, beadOrFormula string
+	var sourceBead existingSlingSourceBead
 	switch {
 	case fromStdin:
 		target = args[0]
@@ -219,6 +220,13 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 	case len(args) == 2:
 		target = args[0]
 		beadOrFormula = args[1]
+		if !isFormula {
+			sourceBead, err = probeExistingSlingSourceBead(cfg, cityPath, beadOrFormula)
+			if err != nil {
+				fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+		}
 	default:
 		// 1-arg: bead ID only, resolve target from rig's default_sling_target.
 		beadOrFormula = args[0]
@@ -226,7 +234,12 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 			fmt.Fprintf(stderr, "gc sling: --formula requires explicit target\n") //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		if !canInferSlingDefaultTargetFromBead(cfg, beadOrFormula) {
+		sourceBead, err = probeExistingSlingSourceBead(cfg, cityPath, beadOrFormula)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if !canInferSlingDefaultTargetFromBead(cfg, beadOrFormula) && !sourceBead.exists {
 			fmt.Fprintf(stderr, "gc sling: inline text requires explicit target\n  usage: gc sling <target> %q\n", beadOrFormula) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -261,20 +274,38 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 
 	sp := newSessionProvider()
 
-	storeDir, store, err := openSlingStoreForSource(cfg, cityPath, beadOrFormula, a)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+	var storeDir string
+	var store beads.Store
+	if sourceBead.exists {
+		storeDir = sourceBead.storeDir
+		store, err = openStoreAtForCity(storeDir, cityPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc sling: opening store %s: %v\n", storeDir, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	} else {
+		storeDir, store, err = openSlingStoreForSource(cfg, cityPath, beadOrFormula, a)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 	storeRef := workflowStoreRefForDir(storeDir, cityPath, cityName, cfg)
 	storeEnv := slingStoreEnv(cfg, cityPath, storeDir)
+	if sourceBead.exists && looksLikeInlineText(cfg, beadOrFormula) {
+		fmt.Fprintf(stderr, "gc sling: found existing bead %q in %s; routing it instead of creating inline text\n", beadOrFormula, storeRef) //nolint:errcheck // best-effort stderr
+	}
 
 	// Inline text mode: if the argument doesn't look like a bead ID
 	// (and we're not in formula mode), create a task bead from the text.
 	// During dry-run, mark the text as preview-only instead of creating it.
 	inlineText := false
 	if !isFormula {
-		createInlineBead, previewInlineText, err := resolveInlineBeadAction(cfg, beadOrFormula, dryRun, store)
+		inlineProbeStore := store
+		if !sourceBead.exists && looksLikeInlineText(cfg, beadOrFormula) {
+			inlineProbeStore = nil
+		}
+		createInlineBead, previewInlineText, err := resolveInlineBeadAction(cfg, beadOrFormula, dryRun, inlineProbeStore)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc sling: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -435,6 +466,48 @@ func openSlingStoreForSource(cfg *config.City, cityPath, beadOrFormula string, a
 		return "", nil, fmt.Errorf("opening store %s: %w", storeDir, err)
 	}
 	return storeDir, store, nil
+}
+
+type existingSlingSourceBead struct {
+	exists   bool
+	storeDir string
+}
+
+func probeExistingSlingSourceBead(cfg *config.City, cityPath, beadID string) (existingSlingSourceBead, error) {
+	storeDir, ok := slingSourceStoreRootForCandidate(cfg, cityPath, beadID)
+	if !ok {
+		return existingSlingSourceBead{}, nil
+	}
+	store, err := openStoreAtForCity(storeDir, cityPath)
+	if err != nil {
+		return existingSlingSourceBead{}, fmt.Errorf("opening store %s: %w", storeDir, err)
+	}
+	exists, err := sling.ProbeBeadInStore(store, beadID)
+	if err != nil {
+		return existingSlingSourceBead{}, fmt.Errorf("checking bead candidate %q: %w", beadID, err)
+	}
+	if !exists {
+		return existingSlingSourceBead{}, nil
+	}
+	return existingSlingSourceBead{exists: true, storeDir: storeDir}, nil
+}
+
+func slingSourceStoreRootForCandidate(cfg *config.City, cityPath, beadID string) (string, bool) {
+	if cfg == nil || !isBeadIDCandidate(beadID) {
+		return "", false
+	}
+	bp := beadPrefix(cfg, beadID)
+	if bp == "" {
+		return "", false
+	}
+	if sling.IsHQPrefix(cfg, bp) {
+		return resolveStoreScopeRoot(cityPath, cityPath), true
+	}
+	rig, found := findRigByPrefix(cfg, bp)
+	if !found || strings.TrimSpace(rig.Path) == "" {
+		return "", false
+	}
+	return resolveStoreScopeRoot(cityPath, rig.Path), true
 }
 
 func canInferSlingDefaultTargetFromBead(cfg *config.City, beadOrFormula string) bool {

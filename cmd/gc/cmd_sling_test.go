@@ -1622,6 +1622,11 @@ func TestCmdSlingConfiguredPrefixAllAlphaExistingBeadUsesPrefixStore(t *testing.
 	t.Setenv("GC_BEADS", "file")
 
 	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
 	frontendDir := filepath.Join(cityDir, "frontend")
 	ordersDir := filepath.Join(cityDir, "orders")
 	for _, dir := range []string{frontendDir, ordersDir} {
@@ -1887,6 +1892,11 @@ func setupCmdSlingConfiguredPrefixAllAlphaFrontendFixture(t *testing.T, defaultT
 	t.Setenv("GC_BEADS", "file")
 
 	cityDir = t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
 	frontendDir = filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(frontendDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(frontend): %v", err)
@@ -2057,11 +2067,185 @@ func TestCmdSlingAcceptsExistingBead(t *testing.T) {
 func TestCmdSlingMultiDashBeadIDRoutesExistingBead(t *testing.T) {
 	// gc sling target fo-spawn-storm must route the existing bead and must
 	// not create a new inline bead, when "fo-spawn-storm" exists in the store.
+	cityDir, rigDir := setupCmdSlingMultiDashBeadFixture(t, true)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"foundations/worker", "fo-spawn-storm"},
+		false, false, false,
+		"", nil, "",
+		true, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Created ") {
+		t.Errorf("created new inline bead instead of routing existing one; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "found existing bead") {
+		t.Errorf("stderr = %q, want existing-bead routing breadcrumb", stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-spawn-storm")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-spawn-storm): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker" {
+		t.Fatalf("rig bead gc.routed_to = %q, want foundations/worker", routed.Metadata["gc.routed_to"])
+	}
+	all, err := rigStore.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("rigStore.List: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("rig store bead count = %d, want 1: %#v", len(all), all)
+	}
+}
+
+func TestCmdSlingOneArgMultiDashExistingBeadUsesDefaultTarget(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingMultiDashBeadFixture(t, true)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"fo-spawn-storm"},
+		false, false, false,
+		"", nil, "",
+		true, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Created ") {
+		t.Fatalf("stdout = %q, want existing bead route without inline creation", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "found existing bead") {
+		t.Errorf("stderr = %q, want existing-bead routing breadcrumb", stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-spawn-storm")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-spawn-storm): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker" {
+		t.Fatalf("rig bead gc.routed_to = %q, want foundations/worker", routed.Metadata["gc.routed_to"])
+	}
+	all, err := rigStore.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("rigStore.List: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("rig store bead count = %d, want 1: %#v", len(all), all)
+	}
+}
+
+func TestCmdSlingCrossRigMultiDashExistingBeadUsesPrefixStore(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingMultiDashBeadFixture(t, false)
+	ordersDir := filepath.Join(cityDir, "orders")
+	if err := os.MkdirAll(ordersDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(orders): %v", err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(ordersDir); err != nil {
+		t.Fatalf("ensurePersistedScopeLocalFileStore(orders): %v", err)
+	}
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "foundations"
+path = "foundations"
+prefix = "fo"
+
+[[rigs]]
+name = "orders"
+path = "orders"
+prefix = "od"
+
+[[agent]]
+name = "worker"
+dir = "orders"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"orders/worker", "fo-spawn-storm"},
+		false, false, true,
+		"", nil, "",
+		true, false, "",
+		true, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Created ") {
+		t.Fatalf("stdout = %q, want existing bead route without inline creation", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "found existing bead") {
+		t.Errorf("stderr = %q, want existing-bead routing breadcrumb", stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-spawn-storm")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-spawn-storm): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "orders/worker" {
+		t.Fatalf("rig bead gc.routed_to = %q, want orders/worker", routed.Metadata["gc.routed_to"])
+	}
+	all, err := rigStore.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("rigStore.List: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("rig store bead count = %d, want 1: %#v", len(all), all)
+	}
+
+	ordersStore, err := openStoreAtForCity(ordersDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(orders): %v", err)
+	}
+	ordersBeads, err := ordersStore.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("ordersStore.List: %v", err)
+	}
+	if len(ordersBeads) != 0 {
+		t.Fatalf("orders store bead count = %d, want 0: %#v", len(ordersBeads), ordersBeads)
+	}
+}
+
+func setupCmdSlingMultiDashBeadFixture(t *testing.T, defaultTarget bool) (cityDir, rigDir string) {
+	t.Helper()
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("GC_BEADS", "file")
 
-	cityDir := t.TempDir()
-	rigDir := filepath.Join(cityDir, "foundations")
+	cityDir = t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	rigDir = filepath.Join(cityDir, "foundations")
 	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(rig): %v", err)
 	}
@@ -2080,6 +2264,10 @@ func TestCmdSlingMultiDashBeadIDRoutesExistingBead(t *testing.T) {
 		Status:   "open",
 		Metadata: map[string]string{},
 	}})
+	defaultTargetLine := ""
+	if defaultTarget {
+		defaultTargetLine = "default_sling_target = \"foundations/worker\"\n"
+	}
 	cityToml := `[workspace]
 name = "demo"
 
@@ -2087,6 +2275,7 @@ name = "demo"
 name = "foundations"
 path = "foundations"
 prefix = "fo"
+` + defaultTargetLine + `
 
 [[agent]]
 name = "worker"
@@ -2096,23 +2285,7 @@ dir = "foundations"
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 	t.Chdir(cityDir)
-
-	var stdout, stderr bytes.Buffer
-	_ = cmdSling(
-		[]string{"foundations/worker", "fo-spawn-storm"},
-		false, false, false,
-		"", nil, "",
-		true, false, "",
-		false, false, false,
-		"", "",
-		&stdout, &stderr,
-	)
-	if strings.Contains(stdout.String(), "Created ") {
-		t.Errorf("created new inline bead instead of routing existing one; stdout=%s stderr=%s", stdout.String(), stderr.String())
-	}
-	if strings.Contains(stderr.String(), "not found") {
-		t.Errorf("unexpected 'not found' error; stderr=%s", stderr.String())
-	}
+	return cityDir, rigDir
 }
 
 func TestCmdSlingRefusesMissingConfiguredFallbackBeadID(t *testing.T) {
