@@ -182,6 +182,44 @@ func pendingCreateStartInFlight(session beads.Bead, clk clock.Clock, startupTime
 	return now.Before(started.Add(startupTimeout + staleKeyDetectDelay + 5*time.Second))
 }
 
+const pendingCreateNeverStartedTimeout = 10 * time.Minute
+
+func pendingCreateNeverStartedExpired(session beads.Bead, clk clock.Clock) bool {
+	if strings.TrimSpace(session.Metadata["pending_create_claim"]) != "true" {
+		return false
+	}
+	if strings.TrimSpace(session.Metadata["state"]) != "creating" {
+		return false
+	}
+	if strings.TrimSpace(session.Metadata["last_woke_at"]) != "" {
+		return false
+	}
+	if session.CreatedAt.IsZero() {
+		return true
+	}
+	now := time.Now()
+	if clk != nil {
+		now = clk.Now()
+	}
+	return now.After(session.CreatedAt.Add(pendingCreateNeverStartedTimeout))
+}
+
+func pendingCreateLeaseExpiredForRollback(session beads.Bead, clk clock.Clock, startupTimeout time.Duration) bool {
+	if strings.TrimSpace(session.Metadata["pending_create_claim"]) != "true" {
+		return false
+	}
+	if strings.TrimSpace(session.Metadata["state"]) != "creating" {
+		return false
+	}
+	if pendingCreateStartInFlight(session, clk, startupTimeout) {
+		return false
+	}
+	if strings.TrimSpace(session.Metadata["last_woke_at"]) == "" {
+		return pendingCreateNeverStartedExpired(session, clk)
+	}
+	return staleCreatingState(session, clk)
+}
+
 // reconcileSessionBeads performs bead-driven reconciliation using wake/sleep
 // semantics. For each session bead, it determines if the session should be
 // awake (has a matching entry in the desired state) and manages lifecycle
@@ -599,7 +637,7 @@ func reconcileSessionBeadsTraced(
 			if cfg != nil {
 				startupTimeout = cfg.Session.StartupTimeoutDuration()
 			}
-			if !pendingCreateStartInFlight(*session, clk, startupTimeout) && staleCreatingState(*session, clk) {
+			if pendingCreateLeaseExpiredForRollback(*session, clk, startupTimeout) {
 				fmt.Fprintf(stderr, "session reconciler: rolling back pending create %s: lease expired and no live runtime\n", name) //nolint:errcheck
 				if trace != nil {
 					trace.recordDecision("reconciler.session.pending_create", tp.TemplateName, name, "pending_create_lease_expired", "rollback", nil, nil, "")
