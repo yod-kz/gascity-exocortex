@@ -20,12 +20,13 @@ import (
 // fakeCityResolver implements CityResolver for testing.
 type fakeCityResolver struct {
 	cities             map[string]*fakeState // keyed by city name
+	listed             []CityInfo
 	pending            map[string]string
 	supervisorRecorder events.Recorder
 }
 
 func (f *fakeCityResolver) ListCities() []CityInfo {
-	var out []CityInfo
+	out := append([]CityInfo(nil), f.listed...)
 	for name := range f.cities {
 		s := f.cities[name]
 		out = append(out, CityInfo{
@@ -219,6 +220,30 @@ func TestSupervisorCityNamespacedRoute(t *testing.T) {
 	}
 	if resp.Total != 1 {
 		t.Errorf("Total = %d, want 1 (one agent in fakeState)", resp.Total)
+	}
+}
+
+func TestSupervisorCityScopedRoute404sUntilCityRunning(t *testing.T) {
+	resolver := &fakeCityResolver{
+		cities: map[string]*fakeState{},
+		listed: []CityInfo{{
+			Name:    "bright-lights",
+			Path:    "/tmp/bright-lights",
+			Running: false,
+			Status:  "starting_agents",
+		}},
+	}
+	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+
+	req := httptest.NewRequest("GET", "/v0/city/bright-lights/agents", nil)
+	rec := httptest.NewRecorder()
+	sm.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), CityNotFoundOrNotRunningDetail("bright-lights")) {
+		t.Fatalf("body missing not-running detail: %s", rec.Body.String())
 	}
 }
 
